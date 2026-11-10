@@ -164,7 +164,8 @@ if ( class_exists( 'WP_CLI' ) ) {
 				);
 	
 				$prev_revision = $wpdb->get_row($prev_revision_sql);
-	
+				$rows_start = ftell($fp);
+
 				// Process standard fields
 				$fields_to_check = array(
 					'post_title' => 'Title',
@@ -231,7 +232,24 @@ if ( class_exists( 'WP_CLI' ) ) {
 				if (function_exists('acf_get_field_groups')) {
 					$this->process_acf_fields($fp, $revision, $prev_revision, $parent, $editor_name, $post_url);
 				}
-	
+
+				// Still log saves with no detectable change, such as custom fields that were not stored with the revision
+				if (ftell($fp) === $rows_start) {
+					fputcsv($fp, array(
+						date('Y-m-d', strtotime($revision->post_date)),
+						date('H:i:s', strtotime($revision->post_date)),
+						$editor_name,
+						$parent->ID,
+						$post_url,
+						$parent->post_type,
+						$parent->post_title,
+						'Saved',
+						'No change detected in the title, content, excerpt, status, or custom fields stored with this revision',
+						'',
+						'',
+					), ",", "\"", "\\", "\n");
+				}
+
 				$progress->tick();
 			}
 	
@@ -699,24 +717,8 @@ if ( class_exists( 'WP_CLI' ) ) {
 		 * Process ACF fields changes
 		 */
 		private function process_acf_fields($fp, $revision, $prev_revision, $parent, $editor_name, $post_url) {
-			// Get field groups for this post type
-			$field_groups = acf_get_field_groups(array(
-				'post_type' => $parent->post_type,
-			));
-	
-			if (empty($field_groups)) return;
-	
 			global $wpdb;
-			$acf_fields = array();
-	
-			// First, gather all fields to check
-			foreach ($field_groups as $field_group) {
-				$fields = acf_get_fields($field_group);
-				foreach ($fields as $field) {
-					$acf_fields[$field['name']] = $field;
-				}
-			}
-	
+
 			// Get all meta keys for this revision
 			$revision_meta_keys_sql = $wpdb->prepare(
 				"SELECT meta_key FROM {$wpdb->postmeta} WHERE post_id = %d",
@@ -736,15 +738,15 @@ if ( class_exists( 'WP_CLI' ) ) {
 			$all_meta_keys = array_unique(array_merge($revision_meta_keys, $prev_meta_keys));
 	
 			foreach ($all_meta_keys as $meta_key) {
-				// Skip internal WordPress meta
-				if (substr($meta_key, 0, 1) === '_' && substr($meta_key, 0, 4) !== '_acf') {
+				// Skip internal meta, including ACF's "_{name}" field-key references
+				if (str_starts_with($meta_key, '_')) {
 					continue;
 				}
-	
-				// Get the field config
-				$field_name = str_replace('_', '', $meta_key);
-				$field = isset($acf_fields[$field_name]) ? $acf_fields[$field_name] : null;
-	
+
+				// ACF stores each value's field key in "_{meta_key}", which also resolves repeater and group subfields
+				$field_key = get_metadata('post', $revision->ID, '_' . $meta_key, true) ?: get_metadata('post', $prev_id, '_' . $meta_key, true);
+				$field = is_string($field_key) && str_starts_with($field_key, 'field_') ? acf_get_field($field_key) : false;
+
 				// If not a recognized ACF field, skip
 				if (!$field) continue;
 	
@@ -786,12 +788,12 @@ if ( class_exists( 'WP_CLI' ) ) {
 						$post_url,
 						$parent->post_type,
 						$parent->post_title,
-						'ACF: ' . $field['label'],
+						'ACF: ' . $field['label'] . ($field['name'] !== $meta_key ? " ($meta_key)" : ''),
 						$diff,
 						$prev_context,
 						$new_context,
 					);
-					fputcsv($fp, $row);
+					fputcsv($fp, $row, ",", "\"", "\\", "\n");
 				}
 			}
 		}
